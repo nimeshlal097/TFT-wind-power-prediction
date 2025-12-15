@@ -4,13 +4,14 @@ import dash
 from dash import dcc, html, Input, Output, State, callback
 import dash_bootstrap_components as dbc
 import plotly.graph_objects as go
+import plotly.express as px
 import pandas as pd
 import numpy as np
 import pickle
 import warnings
 import torch
 from datetime import timedelta
-from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score, mean_absolute_percentage_error
 from pytorch_forecasting import TemporalFusionTransformer
 
 warnings.filterwarnings('ignore')
@@ -18,48 +19,57 @@ warnings.filterwarnings('ignore')
 # ==================== CONFIGURATION ====================
 MODEL_CHECKPOINT = "tft_model.ckpt"
 METADATA_FILE = "tft_metadata.pkl"
-MAX_FORECAST_HORIZON = 12
-DEFAULT_FORECAST_HORIZON = 12  # 12 hours
+DEFAULT_FORECAST_HORIZON = 12
+CONTEXT_WINDOW = 24
 
-print("Loading PyTorch Lightning model...")
+# Load Model
+loaded_model = None
+model_status_msg = "Checking model..."
+model_status_color = "warning"
+
 try:
+    print(f"Loading model from {MODEL_CHECKPOINT}...")
     loaded_model = TemporalFusionTransformer.load_from_checkpoint(MODEL_CHECKPOINT)
     loaded_model.eval()
-    
-    with open(METADATA_FILE, 'rb') as f:
-        loaded_metadata = pickle.load(f)
-    
-    print("✓ Model and metadata loaded successfully")
+    model_status_msg = "✅ Model Loaded Successfully"
+    model_status_color = "success"
+    print("Model loaded.")
 except Exception as e:
-    print(f"Error loading model: {e}")
-    loaded_model = None
-    loaded_metadata = None
+    model_status_msg = f"❌ Model Load Failed: {str(e)}"
+    model_status_color = "danger"
+    print(f"Error: {e}")
 
-# ==================== FEATURE ENGINEERING ====================
-def add_features(df):
+# ==================== PROCESSING FUNCTIONS ====================
+def add_features(df, fill_na=True):
     """Add cyclic, lag, and rolling features for TFT model"""
     df = df.copy()
-    df["Time"] = pd.to_datetime(
-    df["Time"].astype(str).str.strip(),
-    format="%d/%m/%Y %H:%M",
-    errors="coerce"
-    )
+    if df["Time"].dtype == 'object':
+        df["Time"] = pd.to_datetime(
+            df["Time"].astype(str).str.strip(),
+            format="%d/%m/%Y %H:%M",
+            errors="coerce"
+        )
+    
+    # === Handle Missing Time Steps ===
+    df = df.sort_values('Time').set_index('Time')
+    df = df.resample('1H').asfreq()
+    df = df.reset_index()
+    
+    # Interpolate
+    numeric_cols = df.select_dtypes(include=[np.number]).columns
+    df[numeric_cols] = df[numeric_cols].interpolate().ffill().bfill()
+    
+    # Time Index
+    start_time = df['Time'].min()
+    df['idx'] = (df['Time'] - start_time).dt.total_seconds() // 3600
+    df['idx'] = df['idx'].astype(int)
+    
+    # Group
+    if 'group' not in df.columns:
+        df['group'] = '0'
+    df['group'] = df['group'].fillna('0')
 
-    df = df.dropna(subset=["Time"])
-
-    df = df.set_index("Time")
-    df = df.sort_index()
-
-    full_index = pd.date_range(
-        start=df.index.min(),
-        end=df.index.max(),
-        freq="H"
-    )
-
-    df = df.reindex(full_index)
-    df = df.interpolate().ffill().bfill()
-
-    # Cyclic features
+    # Cyclic
     df['hour'] = df['Time'].dt.hour
     df['hour_sin'] = np.sin(2 * np.pi * df['hour'] / 24)
     df['hour_cos'] = np.cos(2 * np.pi * df['hour'] / 24)
@@ -72,228 +82,300 @@ def add_features(df):
     df['dayofweek_sin'] = np.sin(2 * np.pi * df['dayofweek'] / 7)
     df['dayofweek_cos'] = np.cos(2 * np.pi * df['dayofweek'] / 7)
     
-    # Lag features
+    # Lags
     lags = [1, 2, 6, 12, 24, 48]
     for lag in lags:
         df[f'Power_lag{lag}'] = df['Power'].shift(lag)
         df[f'windspeed_100m_lag{lag}'] = df['windspeed_100m'].shift(lag)
     
-    # Rolling features
+    # Rolling
     windows = [6, 12, 24]
     for window in windows:
         df[f'Power_roll_mean_{window}'] = df['Power'].rolling(window).mean()
         df[f'windspeed_100m_roll_mean_{window}'] = df['windspeed_100m'].rolling(window).mean()
         df[f'windspeed_100m_roll_std_{window}'] = df['windspeed_100m'].rolling(window).std()
     
-    # Drop NaNs created by lags/rolling
-    df = df.dropna().reset_index(drop=True)
+    if fill_na:
+        cols = [c for c in df.columns if c != 'Power']
+        num_cols = df.select_dtypes(include=[np.number]).columns
+        cols_num = [c for c in cols if c in num_cols]
+        df[cols_num] = df[cols_num].interpolate().ffill().bfill()
+        df = df.fillna(0)
+        
     return df
 
-# ==================== PREDICTION FUNCTION ====================
-def predict_wind_power(df, forecast_hours, model, metadata, context_window=24):
-    """Predict wind power using TFT with engineered features"""
+def run_prediction_with_interpretation(df, model):
+    """Run model.predict and extract quantiles AND interpretation"""
     try:
-        df_copy = add_features(df)
+        # 1. Predict
+        raw_prediction = model.predict(df, mode="raw", return_x=True)
+        preds = raw_prediction.output["prediction"] # (Batch, Time, Quantiles)
         
-        # Remove duplicates and sort
-        df_copy = df_copy.drop_duplicates(subset='Time', keep='first')
-        df_copy = df_copy.sort_values('Time').reset_index(drop=True)
-        df_copy = df_copy.set_index('Time')
+        # 2. Interpret (Feature Importance & Attention)
+        # === FIX: Use reduction="none" to preserve batch dimension ===
+        interpretation = model.interpret_output(raw_prediction.output, reduction="none")
         
-        # Fill missing hours
-        df_copy = df_copy.asfreq('h')
-        df_copy = df_copy.interpolate(method='linear')
-        df_copy = df_copy.fillna(method='bfill').fillna(method='ffill')
+        # Take the last prediction step (latest forecast)
+        latest_pred = preds[-1] 
         
-        if len(df_copy) < context_window:
-            return {'error': f'Data requires {context_window} hours, got {len(df_copy)}'}
+        # Extract quantiles
+        n_q = latest_pred.shape[-1]
+        res = {'quantiles': {}}
         
-        # Get target and feature columns
-        target_col = metadata.get('target_col', 'Power')
-        feature_cols = [col for col in df_copy.columns if col != target_col]
+        if n_q >= 7:
+            res['quantiles']['p50'] = latest_pred[:, 3].cpu().numpy()
+            res['quantiles']['p10'] = latest_pred[:, 1].cpu().numpy()
+            res['quantiles']['p90'] = latest_pred[:, 5].cpu().numpy()
+            res['quantiles']['p02'] = latest_pred[:, 0].cpu().numpy()
+            res['quantiles']['p98'] = latest_pred[:, 6].cpu().numpy()
+        else:
+            res['quantiles']['p50'] = latest_pred[:, 0].cpu().numpy()
+            res['quantiles']['p10'] = res['quantiles']['p50']
+            res['quantiles']['p90'] = res['quantiles']['p50']
+            res['quantiles']['p02'] = res['quantiles']['p50']
+            res['quantiles']['p98'] = res['quantiles']['p50']
         
-        required_cols = [target_col] + feature_cols
-        if not all(col in df_copy.columns for col in required_cols):
-            return {'error': f'Missing required columns: {set(required_cols) - set(df_copy.columns)}'}
+        # Store Interpretation Data
+        feat_importance = {}
+        for key in ['encoder_variables', 'decoder_variables', 'static_variables']:
+            if key in interpretation:
+                # With reduction="none", shape is (Batch, Features)
+                # We select [-1] for the last sample
+                weights = interpretation[key][-1].cpu().numpy()
+                
+                # Normalize
+                total = weights.sum() + 1e-9
+                feat_importance[key] = (weights / total) * 100
+                
+        res['importance'] = feat_importance
         
-        # Scale numeric features dynamically
-        scaler = MinMaxScaler()
-        data_scaled = scaler.fit_transform(df_copy[required_cols])
-        target_values = data_scaled[:, 0]
-        feature_values = data_scaled[:, 1:]
-        
-        target_tensor = torch.FloatTensor(target_values).unsqueeze(-1)
-        features_tensor = torch.FloatTensor(feature_values)
-        
-        # Context window
-        context_data = target_tensor[-context_window:].unsqueeze(0)
-        context_features = features_tensor[-context_window:].unsqueeze(0)
-        
-        # Prediction
-        with torch.no_grad():
-            predictions = model(context_data, context_features)
-            if predictions.dim() > 2:
-                forecast_scaled = predictions[0, :forecast_hours, 0].cpu().numpy()
+        # Attention
+        if 'attention' in interpretation:
+            # Shape: (Batch, Prediction_Length, Encoder_Length)
+            # We take the last sample -> (Prediction_Length, Encoder_Length)
+            attn = interpretation['attention'][-1].cpu().numpy()
+            
+            # Check dimensions before averaging
+            if attn.ndim == 2:
+                # Average over the horizon to see "general importance of past steps"
+                avg_attn = attn.mean(axis=0) 
+                res['attention'] = avg_attn
+            elif attn.ndim == 1:
+                # Fallback if attention is already collapsed
+                res['attention'] = attn
             else:
-                forecast_scaled = predictions[0, :forecast_hours].cpu().numpy()
-        
-        # Inverse scale
-        forecast_values = scaler.inverse_transform(
-            np.hstack([forecast_scaled.reshape(-1, 1), np.zeros((forecast_hours, len(feature_cols)))])
-        )[:, 0]
-        actual_values = scaler.inverse_transform(data_scaled)[:, 0]
-        
-        # Forecast timestamps
-        last_timestamp = df_copy.index[-1]
-        forecast_timestamps = pd.date_range(
-            start=last_timestamp + timedelta(hours=1),
-            periods=forecast_hours,
-            freq='h'
-        )
-        
-        return {
-            'success': True,
-            'forecast_values': forecast_values[:forecast_hours],
-            'forecast_timestamps': forecast_timestamps,
-            'actual_values': actual_values,
-            'actual_timestamps': df_copy.index,
-            'stats': {
-                'forecast_min': float(np.min(forecast_values[:forecast_hours])),
-                'forecast_max': float(np.max(forecast_values[:forecast_hours])),
-                'forecast_mean': float(np.mean(forecast_values[:forecast_hours])),
-                'actual_mean': float(np.mean(actual_values))
-            }
-        }
-    
+                res['attention'] = None
+            
+        return res, raw_prediction.x
+
     except Exception as e:
-        return {'error': str(e)}
+        # Graceful fallback if interpretation fails
+        print(f"Interpretation Error: {e}")
+        # Re-raise or return minimal results
+        raise e
 
 # ==================== DASH APP ====================
 app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP])
 
 app.layout = dbc.Container([
-    # Header
-    dbc.Row([dbc.Col([html.H1("⚡ Wind Power Forecasting Dashboard", className="text-center mt-4 mb-2"),
-                      html.P("Upload 24 hours of historical data to forecast the next 12 hours", 
-                             className="text-center text-muted mb-4")])]),
+    dbc.Row([dbc.Col([
+        html.H2("⚡ TFT Wind Power Dashboard", className="text-center mt-4"),
+        html.P("Forecast | Evaluation | Feature Attribution", className="text-center text-muted mb-4")
+    ])]),
     
-    # Upload & Settings
+    # Upload & Controls
     dbc.Row([
-        dbc.Col([dbc.Card([dbc.CardBody([
-            html.H5("📤 Upload Historical Data (CSV)", className="card-title"),
-            html.P("Required columns: Time, Power, temperature_2m, relativehumidity_2m, dewpoint_2m, windspeed_10m, windspeed_100m, winddirection_10m, winddirection_100m, windgusts_10m", className="text-muted small"),
-            html.P("✓ Required: 24 hours of hourly data", className="text-info small fw-bold"),
-            dcc.Upload(id='upload-data', children=html.Div(['📁 Drag and Drop or ', html.A('Select Files')]),
-                       style={'width': '100%','height': '60px','lineHeight': '60px','borderWidth': '2px','borderStyle': 'dashed','borderRadius': '5px','textAlign': 'center','cursor': 'pointer','backgroundColor': '#f8f9fa'},
-                       multiple=False),
-            html.Div(id='upload-status', className="mt-2")
-        ])], className="mb-3")], lg=8),
+        dbc.Col([
+            dbc.Card([dbc.CardBody([
+                html.H6("1. Upload Data (CSV)", className="card-subtitle text-muted mb-2"),
+                dcc.Upload(
+                    id='upload-data',
+                    children=html.Div(['📂 Drag & Drop or Click to Upload']),
+                    style={'border': '2px dashed #007bff', 'borderRadius': '10px', 'textAlign': 'center', 'padding': '15px', 'cursor': 'pointer', 'backgroundColor': '#f8f9fa'},
+                    multiple=False
+                ),
+                html.Div(id='file-name-display', className="mt-2 text-primary small fw-bold")
+            ])], className="h-100")
+        ], md=8),
         
-        dbc.Col([dbc.Card([dbc.CardBody([
-            html.H5("⚙️ Prediction Settings", className="card-title"),
-            html.Label("Forecast Hours:", className="fw-bold"),
-            dcc.Slider(id='forecast-slider', min=1, max=MAX_FORECAST_HORIZON, step=1, value=DEFAULT_FORECAST_HORIZON,
-                       marks={i: f"{i}h" for i in range(1, MAX_FORECAST_HORIZON + 1, 3)},
-                       tooltip={"placement": "bottom", "always_visible": True}),
-            html.Label("Model Status:", className="fw-bold mt-4"),
-            html.P("✓ PyTorch Lightning Ready" if loaded_model else "✗ Not Loaded", 
-                   className="text-success" if loaded_model else "text-danger"),
-            dbc.Button("📊 Generate Forecast", id='predict-btn', color="primary", className="mt-3 w-100", disabled=not loaded_model)
-        ])])], lg=4)
+        dbc.Col([
+            dbc.Card([dbc.CardBody([
+                html.H6("2. System Status", className="card-subtitle text-muted mb-2"),
+                dbc.Badge(model_status_msg, color=model_status_color, className="mb-2 p-2 w-100"),
+                dbc.Button("🚀 Run Analysis", id='predict-btn', color="primary", className="w-100", disabled=(loaded_model is None))
+            ])], className="h-100")
+        ], md=4)
     ], className="mb-4"),
     
-    # Messages
-    html.Div(id='error-message', className="mb-3"),
-    html.Div(id='success-message', className="mb-3"),
+    # Main Content Tabs
+    dbc.Tabs([
+        dbc.Tab(label="📈 Forecast & Backtest", tab_id="tab-forecast"),
+        dbc.Tab(label="🧠 Model Insights (XAI)", tab_id="tab-insights"),
+        dbc.Tab(label="📊 Evaluation Metrics", tab_id="tab-metrics"),
+    ], id="tabs", active_tab="tab-forecast", className="mb-3"),
     
-    # Store
-    dcc.Store(id='forecast-data-store'),
+    html.Div(id='tab-content')
     
-    # Results
-    dbc.Row([dbc.Col([dbc.Card([dbc.CardBody([html.H5("📈 Forecast Chart", className="card-title mb-3"), dcc.Graph(id='forecast-graph')])], className="mb-3")])]),
-    
-    # Statistics & Table
-    dbc.Row([
-        dbc.Col([dbc.Card([dbc.CardBody([html.H5("📊 Forecast Statistics", className="card-title"),
-                                         dbc.Row([dbc.Col([html.P("Max Power", className="text-muted small mb-0"), html.H4(id='stat-max', children="--")], md=6),
-                                                  dbc.Col([html.P("Min Power", className="text-muted small mb-0"), html.H4(id='stat-min', children="--")], md=6)]),
-                                         dbc.Row([dbc.Col([html.P("Mean Power", className="text-muted small mb-0"), html.H4(id='stat-mean', children="--")], md=6),
-                                                  dbc.Col([html.P("Historical Avg", className="text-muted small mb-0"), html.H4(id='stat-hist-mean', children="--")], md=6)], className="mt-3")])], className="mb-3")], lg=4),
-        dbc.Col([dbc.Card([dbc.CardBody([html.H5("📋 Detailed Forecast", className="card-title"), html.Div(id='forecast-table')])])], lg=8)
-    ], className="mb-4"),
-    
-], fluid=True, style={'backgroundColor': '#f8f9fa', 'minHeight': '100vh', 'padding': '20px'})
+], fluid=True, style={'backgroundColor': '#f4f6f9', 'minHeight': '100vh', 'padding': '20px'})
 
-# ==================== CALLBACKS ====================
+# --- Callbacks ---
+@callback(Output('file-name-display', 'children'), Input('upload-data', 'filename'))
+def display_name(name): return f"📄 {name}" if name else ""
+
 @callback(
-    [Output('forecast-data-store', 'data'),
-     Output('upload-status', 'children')],
-    Input('upload-data', 'contents'),
-    State('upload-data', 'filename'),
-    prevent_initial_call=True
+    Output('tab-content', 'children'),
+    [Input('predict-btn', 'n_clicks'), Input('tabs', 'active_tab')],
+    [State('upload-data', 'contents'), State('upload-data', 'filename')],
+    prevent_initial_call=False
 )
-def handle_upload(contents, filename):
-    if contents is None:
-        return None, None
+def render_content(n_clicks, active_tab, contents, filename):
+    # Initial Load
+    if not n_clicks and not contents:
+        return dbc.Alert("Please upload a file and click 'Run Analysis' to begin.", color="info")
     
+    if not contents:
+        return dbc.Alert("⚠️ No file uploaded.", color="warning")
+
     try:
-        content_string = contents.split(',')[1]
-        decoded = pd.read_csv(io.StringIO(base64.b64decode(content_string).decode('utf-8')))
-        required_cols = ['Time', 'Power', 'temperature_2m', 'relativehumidity_2m','dewpoint_2m', 'windspeed_10m', 'windspeed_100m', 'winddirection_10m', 'winddirection_100m', 'windgusts_10m']
-        if not all(col in decoded.columns for col in required_cols):
-            return None, dbc.Alert("❌ Missing required columns!", color="danger")
-        if len(decoded) < 24:
-            return None, dbc.Alert(f"❌ Need 24 hours of data, got {len(decoded)}", color="danger")
+        # Process Data
+        content_type, content_string = contents.split(',')
+        decoded = base64.b64decode(content_string)
+        df = pd.read_csv(io.StringIO(decoded.decode('utf-8')))
         
-        # Apply features before storing
-        decoded_features = add_features(decoded)
-        return decoded_features.to_json(date_format='iso', orient='split'), \
-               dbc.Alert(f"✓ {filename} loaded ({len(decoded_features)} rows)", color="success")
-    
+        if len(df) < (CONTEXT_WINDOW + DEFAULT_FORECAST_HORIZON):
+             return dbc.Alert("❌ Not enough data. Need at least 48 hours.", color="danger")
+        
+        df_proc = add_features(df, fill_na=True)
+        
+        # === 1. Run Calculations (Validation & Future) ===
+        
+        # A. Validation (Backtest Last 12h)
+        val_res, val_x = run_prediction_with_interpretation(df_proc, loaded_model)
+        val_preds = val_res['quantiles']
+        
+        val_time = df_proc['Time'].iloc[-DEFAULT_FORECAST_HORIZON:]
+        val_actual = df_proc['Power'].iloc[-DEFAULT_FORECAST_HORIZON:].values
+        
+        # Metrics Calculation
+        mae = mean_absolute_error(val_actual, val_preds['p50'])
+        rmse = np.sqrt(mean_squared_error(val_actual, val_preds['p50']))
+        mape = mean_absolute_percentage_error(val_actual, val_preds['p50'])
+        r2 = r2_score(val_actual, val_preds['p50'])
+
+        # B. Future Forecast
+        last_time = df_proc['Time'].iloc[-1]
+        future_times = [last_time + timedelta(hours=x) for x in range(1, 13)]
+        future_df = pd.DataFrame({'Time': future_times})
+        df_extended = pd.concat([df_proc, future_df], ignore_index=True).ffill()
+        df_extended.loc[df_extended.index[-12:], 'Power'] = np.nan
+        df_fut_proc = add_features(df_extended, fill_na=True)
+        
+        fut_res, _ = run_prediction_with_interpretation(df_fut_proc, loaded_model)
+        fut_preds = fut_res['quantiles']
+
+        # === 2. Render Based on Tab ===
+        
+        if active_tab == "tab-forecast":
+            # --- Forecast Plots ---
+            # Validation Plot
+            fig_val = go.Figure()
+            fig_val.add_trace(go.Scatter(x=list(val_time)+list(val_time)[::-1], y=list(val_preds['p90'])+list(val_preds['p10'])[::-1], fill='toself', fillcolor='rgba(255,0,0,0.1)', line=dict(width=0), name='90% Conf'))
+            fig_val.add_trace(go.Scatter(x=val_time, y=val_preds['p50'], name='Predicted', line=dict(color='red')))
+            fig_val.add_trace(go.Scatter(x=val_time, y=val_actual, name='Actual', mode='markers+lines', line=dict(color='blue')))
+            fig_val.update_layout(title="Backtest: Model vs Actual (Last 12h)", template="plotly_white", margin=dict(l=20, r=20, t=40, b=20))
+            
+            # Future Plot
+            fig_fut = go.Figure()
+            fig_fut.add_trace(go.Scatter(x=list(future_times)+list(future_times)[::-1], y=list(fut_preds['p98'])+list(fut_preds['p02'])[::-1], fill='toself', fillcolor='rgba(0,0,255,0.1)', line=dict(width=0), name='98% Conf'))
+            fig_fut.add_trace(go.Scatter(x=list(future_times)+list(future_times)[::-1], y=list(fut_preds['p90'])+list(fut_preds['p10'])[::-1], fill='toself', fillcolor='rgba(0,0,255,0.2)', line=dict(width=0), name='90% Conf'))
+            fig_fut.add_trace(go.Scatter(x=future_times, y=fut_preds['p50'], name='Future Forecast', line=dict(color='blue', width=3)))
+            fig_fut.update_layout(title="Future Forecast (Next 12h)", template="plotly_white", margin=dict(l=20, r=20, t=40, b=20))
+            
+            return html.Div([
+                dbc.Row([dbc.Col(dcc.Graph(figure=fig_val), lg=6), dbc.Col(dcc.Graph(figure=fig_fut), lg=6)])
+            ])
+
+        elif active_tab == "tab-insights":
+            # --- Feature Importance & Attention ---
+            # 1. Feature Importance Plot
+            importance_data = []
+            if 'encoder_variables' in fut_res['importance']:
+                # Try to use model names if available, else indices
+                try:
+                    enc_names = loaded_model.encoder_variables
+                except:
+                    enc_names = [f"Enc_{i}" for i in range(len(fut_res['importance']['encoder_variables']))]
+                    
+                vals = fut_res['importance']['encoder_variables']
+                if len(enc_names) == len(vals):
+                    for n, v in zip(enc_names, vals): importance_data.append({'Feature': n, 'Importance': v, 'Type': 'Encoder'})
+            
+            if 'decoder_variables' in fut_res['importance']:
+                try:
+                    dec_names = loaded_model.decoder_variables
+                except:
+                    dec_names = [f"Dec_{i}" for i in range(len(fut_res['importance']['decoder_variables']))]
+
+                vals = fut_res['importance']['decoder_variables']
+                if len(dec_names) == len(vals):
+                    for n, v in zip(dec_names, vals): importance_data.append({'Feature': n, 'Importance': v, 'Type': 'Decoder'})
+            
+            if importance_data:
+                df_imp = pd.DataFrame(importance_data).sort_values('Importance', ascending=True)
+                fig_imp = px.bar(df_imp, x='Importance', y='Feature', color='Type', orientation='h', title="Feature Importance (Variable Selection Network)")
+                fig_imp.update_layout(template="plotly_white")
+            else:
+                fig_imp = go.Figure().add_annotation(text="No feature importance available", showarrow=False)
+            
+            # 2. Attention Plot
+            if 'attention' in fut_res and fut_res['attention'] is not None:
+                attn_weights = fut_res['attention']
+                lookback_len = len(attn_weights)
+                x_axis = np.arange(-lookback_len, 0)
+                
+                fig_attn = go.Figure()
+                fig_attn.add_trace(go.Scatter(x=x_axis, y=attn_weights, fill='tozeroy', mode='lines', line=dict(color='purple')))
+                fig_attn.update_layout(
+                    title="Temporal Attention: Which past hours mattered most?",
+                    xaxis_title="Time relative to Forecast Start (Hours)",
+                    yaxis_title="Attention Weight",
+                    template="plotly_white"
+                )
+            else:
+                fig_attn = go.Figure().add_annotation(text="Attention weights not available", showarrow=False)
+            
+            return html.Div([
+                dbc.Row([dbc.Col(dcc.Graph(figure=fig_imp), lg=6), dbc.Col(dcc.Graph(figure=fig_attn), lg=6)]),
+                dbc.Alert("💡 'Attention' shows which historical time steps the model focused on to make the current prediction.", color="light", className="mt-2")
+            ])
+
+        elif active_tab == "tab-metrics":
+            # --- Metrics Table & Residuals ---
+            cards = dbc.Row([
+                dbc.Col(dbc.Card([dbc.CardBody([html.H4(f"{mae:.4f}", className="text-primary"), html.P("MAE (Mean Abs Error)", className="small text-muted")])], className="text-center shadow-sm"), width=3),
+                dbc.Col(dbc.Card([dbc.CardBody([html.H4(f"{rmse:.4f}", className="text-danger"), html.P("RMSE (Root Mean Sq Error)", className="small text-muted")])], className="text-center shadow-sm"), width=3),
+                dbc.Col(dbc.Card([dbc.CardBody([html.H4(f"{mape:.2%}", className="text-warning"), html.P("MAPE (Mean Abs % Error)", className="small text-muted")])], className="text-center shadow-sm"), width=3),
+                dbc.Col(dbc.Card([dbc.CardBody([html.H4(f"{r2:.4f}", className="text-success"), html.P("R² Score", className="small text-muted")])], className="text-center shadow-sm"), width=3),
+            ], className="mb-4")
+            
+            residuals = val_actual - val_preds['p50']
+            fig_res = go.Figure()
+            fig_res.add_trace(go.Bar(x=val_time, y=residuals, name='Residuals', marker_color='gray'))
+            fig_res.add_hline(y=0, line_dash="dash", line_color="black")
+            fig_res.update_layout(title="Prediction Residuals (Actual - Predicted)", xaxis_title="Time", yaxis_title="Error (MW)", template="plotly_white")
+            
+            fig_scat = px.scatter(x=val_actual, y=val_preds['p50'], labels={'x': 'Actual Power', 'y': 'Predicted Power'}, title="Actual vs Predicted Scatter")
+            fig_scat.add_shape(type="line", x0=val_actual.min(), y0=val_actual.min(), x1=val_actual.max(), y1=val_actual.max(), line=dict(color="Red", dash="dash"))
+            fig_scat.update_layout(template="plotly_white")
+
+            return html.Div([
+                cards,
+                dbc.Row([dbc.Col(dcc.Graph(figure=fig_res), lg=8), dbc.Col(dcc.Graph(figure=fig_scat), lg=4)])
+            ])
+            
     except Exception as e:
-        return None, dbc.Alert(f"❌ Error: {str(e)}", color="danger")
+        import traceback
+        return dbc.Alert([html.H5("Error Processing Data", className="alert-heading"), html.Pre(str(e)), html.Pre(traceback.format_exc())], color="danger")
 
-@callback(
-    [Output('forecast-graph', 'figure'),
-     Output('stat-max', 'children'),
-     Output('stat-min', 'children'),
-     Output('stat-mean', 'children'),
-     Output('stat-hist-mean', 'children'),
-     Output('forecast-table', 'children'),
-     Output('error-message', 'children')],
-    Input('predict-btn', 'n_clicks'),
-    State('forecast-data-store', 'data'),
-    State('forecast-slider', 'value'),
-    prevent_initial_call=True
-)
-def generate_forecast(n_clicks, stored_data, forecast_hours):
-    if stored_data is None:
-        empty_fig = go.Figure()
-        return empty_fig, '--', '--', '--', '--', dbc.Alert("Upload data first", color="warning"), dbc.Alert("❌ No data uploaded", color="danger")
-    
-    df = pd.read_json(io.StringIO(stored_data), orient='split')
-    results = predict_wind_power(df, forecast_hours, loaded_model, loaded_metadata)
-    
-    if 'error' in results:
-        empty_fig = go.Figure()
-        return empty_fig, '--', '--', '--', '--', dbc.Alert(f"Error: {results['error']}", color="danger"), dbc.Alert(f"❌ {results['error']}", color="danger")
-    
-    # Chart
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=results['actual_timestamps'], y=results['actual_values'], name='Historical', mode='lines', line=dict(color='blue', width=2)))
-    fig.add_trace(go.Scatter(x=results['forecast_timestamps'], y=results['forecast_values'], name=f'{forecast_hours}-Hour Forecast', mode='lines+markers', line=dict(color='red', width=3, dash='dash'), marker=dict(size=8)))
-    fig.update_layout(title=f"Wind Power Forecast ({forecast_hours} Hours)", xaxis_title="Time", yaxis_title="Power (MW)", hovermode='x unified', template='plotly_white', height=500)
-    
-    # Table
-    table_data = [{'Time': ts.strftime('%Y-%m-%d %H:%M'), 'Power (MW)': f"{val:.2f}"} for ts, val in zip(results['forecast_timestamps'], results['forecast_values'])]
-    table = dbc.Table.from_dataframe(pd.DataFrame(table_data), striped=True, bordered=True, hover=True, className="text-center")
-    
-    return fig, f"{results['stats']['forecast_max']:.2f} MW", f"{results['stats']['forecast_min']:.2f} MW", f"{results['stats']['forecast_mean']:.2f} MW", f"{results['stats']['actual_mean']:.2f} MW", table, None
-
-# ==================== RUN APP ====================
 if __name__ == '__main__':
-    print("\n" + "="*70)
-    print("🚀 Wind Power Dashboard Starting (PyTorch Lightning)...")
-    print("📊 Open http://127.0.0.1:8050 in your browser")
-    print("="*70 + "\n")
-    app.run(debug=False, port=8050, host='127.0.0.1')
+    app.run(debug=True, port=8050)
