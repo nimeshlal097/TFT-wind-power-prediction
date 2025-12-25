@@ -2991,7 +2991,20 @@ dataset_parameters:
             - !!python/tuple
               - 2
               - 1
-            - *id003
+            - !!python/object/apply:numpy.dtype
+              args:
+              - f8
+              - false
+              - true
+              state: !!python/tuple
+              - 3
+              - <
+              - null
+              - null
+              - null
+              - -1
+              - -1
+              - 0
             - false
             - !!binary |
               N/ykHAg02j9Ugfj/PK/SPw==
@@ -3013,7 +3026,20 @@ dataset_parameters:
               - 1
               - !!python/tuple
                 - 2
-              - *id004
+              - !!python/object/apply:numpy.dtype
+                args:
+                - O8
+                - false
+                - true
+                state: !!python/tuple
+                - 3
+                - '|'
+                - null
+                - null
+                - null
+                - -1
+                - -1
+                - 63
               - false
               - - center
                 - scale
@@ -3031,7 +3057,20 @@ dataset_parameters:
               - 1
               - !!python/tuple
                 - 1
-              - *id002
+              - !!python/object/apply:numpy.dtype
+                args:
+                - i8
+                - false
+                - true
+                state: !!python/tuple
+                - 3
+                - <
+                - null
+                - null
+                - null
+                - -1
+                - -1
+                - 0
               - false
               - !!binary |
                 AAAAAAAAAAA=
@@ -3097,10 +3136,10 @@ embedding_sizes:
 hidden_continuous_size: 32
 hidden_continuous_sizes: {}
 hidden_size: 64
-learning_rate: 0.01
+learning_rate: 0.001
 log_gradient_flow: false
 log_interval: 10
-log_val_interval: null
+log_val_interval: 10
 lstm_layers: 1
 mask_bias: -1000000000.0
 max_encoder_length: 48
